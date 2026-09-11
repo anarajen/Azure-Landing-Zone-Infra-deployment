@@ -138,3 +138,269 @@ Authentication is Microsoft Entra OIDC/workload identity federation; no service-
 ## Validation before production apply
 
 The repository is intended to be validated by the Azure DevOps pipeline with the pinned Terraform/provider versions. Always review the generated plan and resolve all enabled-feature build gates before approval.
+
+
+==================================================================================================================================
+
+Azure Implementation via Azure DevOps – Terraform Deployment Procedure
+Azure Landing Zone | Production Implementation & BAU Procedure
+
+1. Purpose
+This document provides a generic, step-by-step procedure for deploying the Azure Landing Zone implementation through Azure DevOps using Terraform. It covers initial prerequisites, Terraform remote state bootstrap, the main deployment pipeline, approvals, validation, and the recommended BAU change process.
+2. High-Level Deployment Flow
+Azure DevOps Repository
+        ↓
+Bootstrap Pipeline (first-time setup)
+        ↓
+Azure Storage – Terraform Remote State
+        ↓
+Main Terraform Pipeline
+        ↓
+Terraform Format / Init / Validate / Plan
+        ↓
+Plan Artifact
+        ↓
+Azure DevOps Production Approval
+        ↓
+Terraform Apply – Exact Approved Plan
+        ↓
+Azure Resources
+        ↓
+Post-Deployment Validation
+3. Repository / Pipeline Structure
+The uploaded implementation contains two key Azure DevOps pipelines:
+•	pipelines/azure-pipelines-bootstrap.yml – prepares the Terraform remote state infrastructure.
+•	pipelines/azure-pipelines.yml – performs the main Azure infrastructure deployment.
+•	environments/prod/terraform.tfvars – production environment configuration.
+•	environments/prod/backend.hcl – production Terraform backend configuration.
+•	docs/BUILD_GATES.md – implementation prerequisites/build gates.
+•	scripts/export-azure-oidc.sh – prepares Azure OIDC/WIF authentication variables.
+4. Prerequisites
+4.1 Azure Subscription and Identity
+•	Confirm the target Azure subscription and Microsoft Entra tenant.
+•	Create/configure an Azure DevOps Azure Resource Manager service connection.
+•	Recommended service connection name: SPN-AzureDevOps.
+•	Use Workload Identity Federation (OIDC) rather than storing a long-lived client secret where supported.
+•	Ensure the service connection has the required permissions to deploy the Terraform resources.
+•	Confirm the Terraform deployment identity and subscription/tenant validation values used by the repository.
+4.2 Azure DevOps Agent
+•	Ensure the required Azure DevOps agent pool is available.
+•	For the uploaded pipeline, verify that the expected agent is available, such as agent-iwmf-sea-pipeline-01.
+•	Confirm the agent has network access to Azure and any required private endpoints/resources.
+•	Confirm Terraform and Azure CLI prerequisites are available on the agent or installed by the pipeline.
+4.3 Azure DevOps Variable Group
+Create the variable group:
+iwmf2-prod-secrets
+Store sensitive values as secret variables. Examples include:
+Variable	Secret	Purpose
+VM_ADMIN_PASSWORD	Yes	Windows VM local administrator password
+S2S_SHARED_KEY	Yes	Site-to-Site VPN pre-shared key
+P2S_RADIUS_SECRET	Yes	P2S RADIUS secret, if applicable
+TRUSTED_ROOT_CERTIFICATE_DATA	Yes	Trusted root certificate data, if applicable
+5. Terraform Remote State
+The implementation uses an Azure Storage Account for centralized Terraform state.
+•	Resource Group: rg-iwmf-sea-tfstate-01
+•	Storage Account: stiwmfseatf01
+•	Blob Container: tfstate
+•	Production state path: iwmf/prod/terraform.tfstate
+The backend is configured for Azure AD/OIDC authentication rather than a storage access key.
+terraform {
+  backend "azurerm" {
+    use_azuread_auth = true
+    use_oidc         = true
+  }
+}
+6. Step 1 – Run the Bootstrap Pipeline
+1.	Open Azure DevOps and select the project containing the Terraform repository.
+2.	Go to Pipelines → New Pipeline.
+3.	Select the Azure Repos/Git repository containing the Azure Landing Zone code.
+4.	Select Existing Azure Pipelines YAML file.
+5.	Select pipelines/azure-pipelines-bootstrap.yml.
+6.	Run the bootstrap pipeline after confirming the service connection and permissions.
+The bootstrap process prepares the Terraform state resources and migrates the bootstrap state to the Azure Storage backend where required.
+The bootstrap pipeline is normally a one-time activity unless the Terraform state infrastructure must be recreated.
+7. Step 2 – Review Production Configuration
+Before running the main deployment, review:
+•	environments/prod/terraform.tfvars
+•	environments/prod/backend.hcl
+•	docs/BUILD_GATES.md
+The production configuration should be reviewed against the approved HLD/LLD, network diagram, security requirements, and customer-approved values.
+8. Production Configuration – Key Areas to Validate
+Area	Example / Current Configuration	Validation Required
+Project / Environment	iwmf / prod	Confirm naming convention
+Azure Region	Southeast Asia	Confirm approved region
+Hub VNET	172.16.0.0/20	Confirm CIDR does not overlap
+Spoke VNET	172.16.16.0/20	Confirm CIDR does not overlap
+P2S	10.100.0.0/24	Confirm approved client address range
+VPN Gateway	Enabled	Confirm S2S requirements
+Application Gateway	Enabled	Confirm WAF/FQDN/certificate requirements
+Compute	Enabled	Confirm VM image, size and disks
+Private Endpoints	Enabled	Confirm DNS/private connectivity design
+Monitoring	Enabled	Confirm Log Analytics/alerts
+Backup	Enabled	Confirm retention and recovery requirements
+Defender	Enabled	Confirm security requirements
+DDoS IP Protection	Enabled	Confirm security/FinOps approval
+Bastion	Disabled	Confirm whether required
+Resource Locks	Disabled	Confirm whether required
+9. Step 3 – Configure Azure DevOps Production Environment Approval
+7.	Go to Azure DevOps → Pipelines → Environments.
+8.	Create an environment named iwmf2-prod.
+9.	Configure an Approval and Check for the production environment.
+10.	Add the appropriate infrastructure/customer/CAB approver group or users.
+11.	Ensure the approval is required before Terraform Apply.
+Recommended production flow:
+Terraform Plan → Plan Review → Approval → Terraform Apply
+10. Step 4 – Run the Main Deployment Pipeline
+12.	Go to Azure DevOps → Pipelines.
+13.	Create or select the pipeline using pipelines/azure-pipelines.yml.
+14.	Confirm the pipeline uses the correct Azure DevOps service connection.
+15.	Confirm the iwmf2-prod-secrets variable group is available to the pipeline.
+16.	Run the pipeline manually, as the production pipeline is configured without an automatic trigger.
+The pipeline should first execute the validation and planning stage.
+11. Stage 1 – Validate and Plan
+11.1 Terraform Format
+terraform fmt -recursive
+Formats the Terraform code and helps identify formatting inconsistencies.
+11.2 Terraform Init
+terraform init -reconfigure -backend-config='environments/prod/backend.hcl'
+Initializes Terraform and connects the deployment to the configured Azure Storage remote state.
+11.3 Terraform Validate
+terraform validate
+Validates the Terraform configuration before any Azure resource changes are made.
+11.4 Terraform Plan
+terraform plan -var-file='environments/prod/terraform.tfvars' -out='iwmf-prod.tfplan'
+Terraform calculates the resources that will be created, modified, or destroyed.
+Review the plan carefully. In a new implementation, unexpected DESTROY actions should be treated as a stop condition unless they are explicitly approved.
+12. Step 5 – Review and Publish the Terraform Plan
+The pipeline publishes the Terraform plan as an artifact, for example:
+•	iwmf-prod.tfplan
+•	iwmf-prod-plan.txt
+The plan artifact provides a record of what Terraform intended to deploy before approval.
+13. Step 6 – Production Approval
+17.	Review the Terraform plan output/artifact.
+18.	Confirm there are no unexpected resource deletions or configuration changes.
+19.	Confirm network, security, VM, VPN, application gateway, monitoring and backup changes are expected.
+20.	Obtain the configured Azure DevOps production approval.
+21.	Only after approval should the Apply stage proceed.
+14. Stage 2 – Terraform Apply
+The Apply stage downloads the previously generated Terraform plan and applies that exact plan.
+terraform apply -auto-approve '$(Pipeline.Workspace)/terraform-plan/iwmf-prod.tfplan'
+This approach is preferable to generating a new plan after approval because the approved plan is the one that gets applied.
+15. Azure Resources Covered by the Implementation
+Depending on the feature flags and module configuration, the implementation can include:
+Networking: Resource Groups, VNETs, subnets, NSGs, routes, NAT Gateway, Public IPs, VNET peering, VPN Gateway, Local Network Gateway and VPN connections.
+Application: Application Gateway, WAF policy and Load Balancer components.
+Compute: Windows VM, NIC, managed disks, data disks and VM extensions.
+Security: Key Vault, Managed Identity, RBAC role assignments, Defender, policies and optional resource locks.
+Monitoring: Log Analytics, Data Collection Rules, diagnostic settings, metric alerts and action groups.
+Backup: Recovery Services Vault, backup policy and VM protection.
+Private Connectivity: Private Endpoints, Private DNS zones, VNET links and private DNS resolver components.
+Other Platform Services: Bastion, budget, maintenance configuration and DDoS IP protection where enabled.
+16. Recommended Deployment Sequence
+22.	Terraform foundation and remote state.
+23.	Base networking – Resource Groups, VNETs, subnets, NSGs and routing.
+24.	VPN connectivity and Local Network Gateway, where applicable.
+25.	Security/platform – Key Vault, identities, RBAC, policies and Defender.
+26.	Private connectivity and DNS.
+27.	Monitoring and backup.
+28.	Compute – VM, NIC, disks and extensions.
+29.	Application Gateway/WAF and application-facing components.
+30.	Post-deployment validation.
+Although Terraform can deploy all dependencies in one execution, a phased implementation approach can make troubleshooting and customer validation easier for a major production landing zone.
+17. Pre-Deployment Build Gates
+Component	Information to Confirm
+S2S VPN	Office public IP, office CIDRs, approved IPsec/IKE policy and S2S shared key.
+Compute	Approved VM image/version, administrator username/password, VM size and OS/data disk requirements.
+Application Gateway	Source CIDRs, public/private FQDNs, health probe, listener and certificate requirements.
+P2S VPN	Authentication model and certificate/Entra/RADIUS information, if applicable.
+Private Endpoints	Private DNS zone design and required VNET links.
+Monitoring	Log Analytics workspace, alert thresholds and notification recipients.
+Backup	Retention period, backup schedule and recovery requirements.
+18. Post-Deployment Validation
+After Terraform Apply completes successfully, validate at minimum:
+•	All expected resource groups and Azure resources are present.
+•	VNETs, subnets, NSGs and route configuration are correct.
+•	VPN Gateway and S2S tunnel status, where applicable.
+•	VM provisioning, connectivity, disks and required extensions.
+•	Application Gateway listener/backend/health probe status.
+•	Key Vault access and RBAC assignments.
+•	Private Endpoint and Private DNS resolution.
+•	Log Analytics/monitoring and diagnostic settings.
+•	Backup configuration and protected item status.
+•	Defender/security configuration.
+•	No unexpected resources or configuration changes were introduced.
+•	Terraform state is updated and remains accessible to the deployment identity.
+19. Recommended BAU Change Process
+BAU Requirement
+     ↓
+Modify Terraform code / tfvars
+     ↓
+Git Commit / Branch
+     ↓
+Pull Request / Code Review
+     ↓
+Merge / Approved Change
+     ↓
+Azure DevOps Pipeline
+     ↓
+Terraform Validate + Plan
+     ↓
+Review Plan
+     ↓
+Production Approval
+     ↓
+Terraform Apply
+     ↓
+Azure Validation
+For infrastructure managed by Terraform, Terraform should be the source of truth for ongoing BAU changes. Avoid making untracked manual Azure Portal changes because they can create configuration drift.
+20. Terraform vs. Manual Azure Portal Changes
+Activity	Recommended Method	Reason
+New Azure infrastructure	Terraform via Azure DevOps	Consistent and repeatable deployment
+Standard BAU infrastructure change	Terraform via PR + pipeline	Auditability and change control
+Emergency break-fix	Portal/CLI may be used if necessary	Restore service quickly; reconcile Terraform afterward
+Secret update	Azure DevOps secret variable / approved secret store	Avoid hard-coded secrets
+Production configuration	Terraform variables + approved pipeline	Controlled change
+21. Important Implementation Controls
+•	Do not commit passwords, VPN PSKs or other secrets to Git.
+•	Use Azure DevOps secret variables/approved secret management.
+•	Use a remote Terraform state backend.
+•	Restrict production Apply through Azure DevOps environment approval.
+•	Review Terraform Plan before every production change.
+•	Treat unexpected DESTROY actions as a stop-and-review condition.
+•	Keep the Terraform repository, state and deployment identity access controlled.
+•	Avoid manual Azure Portal changes to Terraform-managed resources.
+•	If an emergency manual change is unavoidable, reconcile the Terraform code/state afterward.
+•	Retain pipeline logs, approvals and plan artifacts according to the organization's change-management policy.
+22. Production Implementation Checklist
+•	☐ Azure DevOps project and repository ready
+•	☐ Azure DevOps Azure Resource Manager service connection created
+•	☐ OIDC/Workload Identity Federation configured
+•	☐ Required Azure RBAC permissions assigned
+•	☐ Required Azure DevOps agent available
+•	☐ Production variable group iwmf2-prod-secrets created
+•	☐ Required secrets added securely
+•	☐ Terraform state Resource Group/Storage Account/container confirmed
+•	☐ Bootstrap pipeline executed successfully
+•	☐ Production tfvars reviewed and approved
+•	☐ Build gates reviewed and satisfied
+•	☐ Network CIDRs approved
+•	☐ VPN values and IPsec policy confirmed
+•	☐ VM image/size/disk requirements confirmed
+•	☐ Application Gateway/WAF requirements confirmed
+•	☐ Private Endpoint/DNS design confirmed
+•	☐ Monitoring and alerting approved
+•	☐ Backup and retention approved
+•	☐ Security/Defender requirements approved
+•	☐ DDoS configuration approved where enabled
+•	☐ Azure DevOps iwmf2-prod environment created
+•	☐ Production approval/check configured
+•	☐ Main pipeline executed
+•	☐ Terraform validate successful
+•	☐ Terraform plan reviewed
+•	☐ No unexpected DESTROY actions
+•	☐ Production approval obtained
+•	☐ Terraform apply successful
+•	☐ Post-deployment Azure validation completed
+•	☐ Documentation/change record updated
+23. Summary
+The recommended implementation process is: configure the Azure DevOps service connection and OIDC authentication, configure the required secrets, run the bootstrap pipeline to establish Terraform remote state, review the production configuration and build gates, run the main pipeline to validate and generate a Terraform plan, review the plan, obtain the production approval, and finally apply the exact approved plan. After deployment, validate the Azure resources and use the same Git/PR/Plan/Approval/Apply process for future BAU changes.
