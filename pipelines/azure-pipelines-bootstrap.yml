@@ -1,0 +1,262 @@
+trigger: none
+pr: none
+
+variables:
+  terraformVersion: '1.15.8'
+  azureServiceConnection: 'SPN-AzureDevOps'
+  bootstrapRoot: '$(Build.SourcesDirectory)/bootstrap'
+
+stages:
+- stage: BootstrapState
+  displayName: Bootstrap Terraform remote state
+
+  jobs:
+  - job: Bootstrap
+    displayName: Bootstrap Terraform State
+
+    pool:
+      name : agent-iwmf-sea-pipeline-01
+
+    steps:
+    - checkout: self
+      clean: true
+
+    - script: |
+       curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+       sudo apt-get install -y unzip
+      displayName: Install Azure CLI     
+    - task: AzureCLI@2
+      displayName: Create/adopt state resources and migrate bootstrap state
+
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        addSpnToEnvironment: true
+        workingDirectory: '$(Build.SourcesDirectory)'
+
+        inlineScript: |
+          set -euo pipefail
+
+          echo "=================================================="
+          echo " IWMF2 - Terraform State Bootstrap"
+          echo "=================================================="
+
+          # --------------------------------------------------
+          # Install Terraform
+          # --------------------------------------------------
+          export TERRAFORM_VERSION='$(terraformVersion)'
+
+          bash ./scripts/install-terraform.sh
+
+          export PATH="$HOME/bin:$PATH"
+
+          terraform version
+
+          # --------------------------------------------------
+          # Azure DevOps Workload Identity Federation
+          # --------------------------------------------------
+          source ./scripts/export-azure-oidc.sh
+
+          # --------------------------------------------------
+          # Validate expected Azure identity
+          # --------------------------------------------------
+          EXPECTED_SUBSCRIPTION_ID="0bec3890-91f5-46f9-954a-434049775d9a"
+          EXPECTED_TENANT_ID="3931aa7a-2905-494d-81a2-a046c1c68db7"
+          EXPECTED_CLIENT_ID="05069eac-f757-41c7-85cf-e2180adbbf14"
+
+          CURRENT_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+          CURRENT_TENANT_ID=$(az account show --query tenantId -o tsv)
+
+          echo ""
+          echo "=================================================="
+          echo " Azure Authentication Validation"
+          echo "=================================================="
+          echo "Subscription ID : $CURRENT_SUBSCRIPTION_ID"
+          echo "Tenant ID       : $CURRENT_TENANT_ID"
+          echo "Client ID       : $servicePrincipalId"
+
+          if [ "$CURRENT_SUBSCRIPTION_ID" != "$EXPECTED_SUBSCRIPTION_ID" ]; then
+            echo "ERROR: Incorrect Azure Subscription."
+            echo "Expected: $EXPECTED_SUBSCRIPTION_ID"
+            echo "Actual:   $CURRENT_SUBSCRIPTION_ID"
+            exit 1
+          fi
+
+          if [ "$CURRENT_TENANT_ID" != "$EXPECTED_TENANT_ID" ]; then
+            echo "ERROR: Incorrect Azure Tenant."
+            echo "Expected: $EXPECTED_TENANT_ID"
+            echo "Actual:   $CURRENT_TENANT_ID"
+            exit 1
+          fi
+
+          if [ "$servicePrincipalId" != "$EXPECTED_CLIENT_ID" ]; then
+            echo "ERROR: Incorrect Azure DevOps Service Principal."
+            echo "Expected: $EXPECTED_CLIENT_ID"
+            echo "Actual:   $servicePrincipalId"
+            exit 1
+          fi
+
+          echo ""
+          echo "Azure authentication validation PASSED."
+
+          # --------------------------------------------------
+          # Terraform remote state configuration
+          # --------------------------------------------------
+          RG='rg-iwmf-sea-tfstate-01'
+          SA='stiwmfseatf01'
+          CONTAINER='tfstate'
+          KEY='iwmf/prod/bootstrap.tfstate'
+
+          echo ""
+          echo "=================================================="
+          echo " Terraform Backend"
+          echo "=================================================="
+          echo "Resource Group  : $RG"
+          echo "Storage Account : $SA"
+          echo "Container       : $CONTAINER"
+          echo "State Key       : $KEY"
+
+          # --------------------------------------------------
+          # Check whether remote backend already exists
+          # --------------------------------------------------
+          if az storage account show \
+            --resource-group "$RG" \
+            --name "$SA" \
+            >/dev/null 2>&1; then
+
+            echo ""
+            echo "Existing Terraform backend detected."
+
+            cat > bootstrap/backend.generated.tf <<'BACKEND'
+          terraform {
+            backend "azurerm" {
+              use_azuread_auth = true
+              use_oidc         = true
+            }
+          }
+          BACKEND
+
+            terraform -chdir=bootstrap init \
+              -reconfigure \
+              -backend-config="resource_group_name=$RG" \
+              -backend-config="storage_account_name=$SA" \
+              -backend-config="container_name=$CONTAINER" \
+              -backend-config="key=$KEY"
+
+          else
+
+            echo ""
+            echo "Terraform backend does not exist."
+            echo "First bootstrap will use local state."
+
+            terraform -chdir=bootstrap init
+
+          fi
+
+          # --------------------------------------------------
+          # Resolve Service Principal Object ID
+          # --------------------------------------------------
+          echo ""
+          echo "Resolving Service Principal Object ID..."
+
+          DEPLOYMENT_PRINCIPAL_OBJECT_ID=$(
+            az ad sp show \
+              --id "$servicePrincipalId" \
+              --query id \
+              -o tsv
+          )
+
+          if [ -z "$DEPLOYMENT_PRINCIPAL_OBJECT_ID" ]; then
+            echo "ERROR: Service Principal Object ID could not be resolved."
+            exit 1
+          fi
+
+          echo "Service Principal Object ID:"
+          echo "$DEPLOYMENT_PRINCIPAL_OBJECT_ID"
+
+          # --------------------------------------------------
+          # Terraform Plan
+          # --------------------------------------------------
+          echo ""
+          echo "=================================================="
+          echo " Terraform Bootstrap Plan"
+          echo "=================================================="
+
+          terraform -chdir=bootstrap plan \
+            -var="deployment_principal_id=$DEPLOYMENT_PRINCIPAL_OBJECT_ID" \
+            -out=bootstrap.tfplan
+
+          # --------------------------------------------------
+          # Terraform Apply
+          # --------------------------------------------------
+          echo ""
+          echo "=================================================="
+          echo " Terraform Bootstrap Apply"
+          echo "=================================================="
+
+          terraform -chdir=bootstrap apply \
+            -auto-approve \
+            bootstrap.tfplan
+
+          # --------------------------------------------------
+          # First run only: migrate local state
+          # --------------------------------------------------
+          if [ ! -f bootstrap/backend.generated.tf ]; then
+
+            echo ""
+            echo "=================================================="
+            echo " Migrating Terraform State to Azure Storage"
+            echo "=================================================="
+
+            cat > bootstrap/backend.generated.tf <<'BACKEND'
+          terraform {
+            backend "azurerm" {
+              use_azuread_auth = true
+              use_oidc         = true
+            }
+          }
+          BACKEND
+
+            MIGRATION_SUCCESS=false
+
+            for i in 1 2 3 4 5 6; do
+
+              echo ""
+              echo "State migration attempt $i of 6..."
+
+              if terraform -chdir=bootstrap init \
+                -migrate-state \
+                -force-copy \
+                -backend-config="resource_group_name=$RG" \
+                -backend-config="storage_account_name=$SA" \
+                -backend-config="container_name=$CONTAINER" \
+                -backend-config="key=$KEY"; then
+
+                MIGRATION_SUCCESS=true
+                break
+              fi
+
+              echo "Backend/RBAC not ready yet."
+              echo "Waiting 20 seconds..."
+              sleep 20
+
+            done
+
+            if [ "$MIGRATION_SUCCESS" != "true" ]; then
+              echo "ERROR: Terraform state migration failed after 6 attempts."
+              exit 1
+            fi
+
+            echo ""
+            echo "Terraform bootstrap state migrated successfully."
+
+          fi
+
+          echo ""
+          echo "=================================================="
+          echo " IWMF2 Terraform Bootstrap COMPLETED"
+          echo "=================================================="
+
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
